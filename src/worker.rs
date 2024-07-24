@@ -11,16 +11,19 @@ use bevy::{
         render_resource::{Buffer, ComputePipeline},
         renderer::{RenderDevice, RenderQueue},
     },
-    utils::HashMap,
+    utils::{hashbrown::hash_map::Entry, HashMap},
 };
 use bytemuck::{bytes_of, cast_slice, from_bytes, AnyBitPattern, NoUninit};
-use wgpu::{BindGroupEntry, CommandEncoder, CommandEncoderDescriptor, ComputePassDescriptor};
+use wgpu::{
+    BindGroupEntry, BindingResource, CommandEncoder, CommandEncoderDescriptor,
+    ComputePassDescriptor, TextureViewDescriptor,
+};
 
 use crate::{
     error::{Error, Result},
     pipeline_cache::{AppPipelineCache, CachedAppComputePipelineId},
     traits::ComputeWorker,
-    worker_builder::AppComputeWorkerBuilder,
+    worker_builder::{AppComputeWorkerBuilder, BindingData},
 };
 
 #[derive(PartialEq, Clone, Copy)]
@@ -68,8 +71,7 @@ pub struct AppComputeWorker<W: ComputeWorker> {
     render_queue: RenderQueue,
     cached_pipeline_ids: HashMap<String, CachedAppComputePipelineId>,
     pipelines: HashMap<String, Option<ComputePipeline>>,
-    buffers: HashMap<String, Buffer>,
-    staging_buffers: HashMap<String, StagingBuffer>,
+    binding_data: HashMap<String, BindingData>,
     steps: Vec<Step>,
     command_encoder: Option<CommandEncoder>,
     run_mode: RunMode,
@@ -102,8 +104,7 @@ impl<W: ComputeWorker> From<&AppComputeWorkerBuilder<'_, W>> for AppComputeWorke
             render_queue,
             cached_pipeline_ids: builder.cached_pipeline_ids.clone(),
             pipelines,
-            buffers: builder.buffers.clone(),
-            staging_buffers: builder.staging_buffers.clone(),
+            binding_data: builder.binding_data.clone(),
             steps: builder.steps.clone(),
             command_encoder,
             run_mode: builder.run_mode,
@@ -123,16 +124,27 @@ impl<W: ComputeWorker> AppComputeWorker<W> {
         };
 
         let mut entries = vec![];
+
         for (index, var) in compute_pass.vars.iter().enumerate() {
-            let Some(buffer) = self.buffers.get(var) else {
+            let Some(data) = self.binding_data.get(var) else {
                 return Err(Error::BufferNotFound(var.to_owned()));
             };
 
-            let entry = BindGroupEntry {
-                binding: index as u32,
-                resource: buffer.as_entire_binding(),
+            let entry = match data {
+                BindingData::Buffer(buffer) => BindGroupEntry {
+                    binding: index as u32,
+                    resource: buffer.as_entire_binding(),
+                },
+                BindingData::Sampler(sampler) => BindGroupEntry {
+                    binding: index as u32,
+                    resource: BindingResource::Sampler(&sampler),
+                },
+                BindingData::TextureView(view) => BindGroupEntry {
+                    binding: index as u32,
+                    resource: BindingResource::TextureView(&view),
+                },
+                _ => unreachable!(),
             };
-
             entries.push(entry);
         }
 
@@ -171,149 +183,35 @@ impl<W: ComputeWorker> AppComputeWorker<W> {
 
     #[inline]
     fn swap(&mut self, index: usize) -> Result<()> {
-        let (buf_a_name, buf_b_name) = match &self.steps[index] {
+        let data_name = match &self.steps[index] {
             Step::ComputePass(_) => {
                 return Err(Error::InvalidStep(format!("{:?}", self.steps[index])))
             }
-            Step::Swap(a, b) => (a.as_str(), b.as_str()),
+            Step::Swap(a, b) => [a.as_str(), b.as_str()],
         };
 
-        if !self.buffers.contains_key(buf_a_name) {
-            return Err(Error::BufferNotFound(buf_a_name.to_owned()));
+        for key in data_name {
+            if !self.binding_data.contains_key(key) {
+                return Err(Error::BufferNotFound(key.to_string()));
+            }
         }
 
-        if !self.buffers.contains_key(buf_b_name) {
-            return Err(Error::BufferNotFound(buf_b_name.to_owned()));
-        }
+        let data_array = self.binding_data.get_many_mut(data_name).unwrap();
 
-        let [buffer_a, buffer_b] = self.buffers.get_many_mut([buf_a_name, buf_b_name]).unwrap();
-        std::mem::swap(buffer_a, buffer_b);
-
-        Ok(())
-    }
-
-    #[inline]
-    fn read_staging_buffers(&mut self) -> Result<&mut Self> {
-        for (name, staging_buffer) in &self.staging_buffers {
-            let Some(encoder) = &mut self.command_encoder else {
-                return Err(Error::EncoderIsNone);
-            };
-            let Some(buffer) = self.buffers.get(name) else {
-                return Err(Error::BufferNotFound(name.to_owned()));
-            };
-
-            encoder.copy_buffer_to_buffer(
-                buffer,
-                0,
-                &staging_buffer.buffer,
-                0,
-                staging_buffer.buffer.size(),
-            );
-        }
-        Ok(self)
-    }
-
-    #[inline]
-    fn map_staging_buffers(&mut self) -> &mut Self {
-        for (_, staging_buffer) in self.staging_buffers.iter_mut() {
-            let read_buffer_slice = staging_buffer.buffer.slice(..);
-
-            read_buffer_slice.map_async(wgpu::MapMode::Read, |result| {
-                if let Some(err) = result.err() {
-                    panic!("{}", err.to_string());
+        for (name, data) in data_name.into_iter().zip(data_array.iter()) {
+            match data {
+                BindingData::Buffer(_) | BindingData::TextureView(_) => {}
+                _ => {
+                    return Err(Error::BufferNotFound(name.to_string()));
                 }
-            });
+            }
         }
-        self
-    }
 
-    /// Read data from `target` staging buffer, return raw bytes
-    #[inline]
-    pub fn try_read_raw<'a>(&'a self, target: &str) -> Result<(impl Deref<Target = [u8]> + 'a)> {
-        let Some(staging_buffer) = &self.staging_buffers.get(target) else {
-            return Err(Error::StagingBufferNotFound(target.to_owned()));
-        };
+        let [data_a, data_b] = data_array;
 
-        let result = staging_buffer.buffer.slice(..).get_mapped_range();
-
-        Ok(result)
-    }
-
-    /// Read data from `target` staging buffer, return raw bytes
-    /// Panics on error.
-    #[inline]
-    pub fn read_raw<'a>(&'a self, target: &str) -> (impl Deref<Target = [u8]> + 'a) {
-        self.try_read_raw(target).unwrap()
-    }
-
-    /// Try Read data from `target` staging buffer, return a single `B: Pod`
-    #[inline]
-    pub fn try_read<B: AnyBitPattern>(&self, target: &str) -> Result<B> {
-        let result = *from_bytes::<B>(&self.try_read_raw(target)?);
-        Ok(result)
-    }
-
-    /// Try Read data from `target` staging buffer, return a single `B: Pod`
-    /// In case of error, this function will panic.
-    #[inline]
-    pub fn read<B: AnyBitPattern>(&self, target: &str) -> B {
-        self.try_read(target).unwrap()
-    }
-
-    /// Try Read data from `target` staging buffer, return a vector of `B: Pod`
-    #[inline]
-    pub fn try_read_vec<B: AnyBitPattern>(&self, target: &str) -> Result<Vec<B>> {
-        let bytes = self.try_read_raw(target)?;
-        Ok(cast_slice::<u8, B>(&bytes).to_vec())
-    }
-
-    /// Try Read data from `target` staging buffer, return a vector of `B: Pod`
-    /// In case of error, this function will panic.
-    #[inline]
-    pub fn read_vec<B: AnyBitPattern>(&self, target: &str) -> Vec<B> {
-        self.try_read_vec(target).unwrap()
-    }
-
-    /// Write data to `target` buffer.
-    #[inline]
-    pub fn try_write<T: NoUninit>(&mut self, target: &str, data: &T) -> Result<()> {
-        let Some(buffer) = &self.buffers.get(target) else {
-            return Err(Error::BufferNotFound(target.to_owned()));
-        };
-
-        let bytes = bytes_of(data);
-
-        self.render_queue.write_buffer(buffer, 0, bytes);
+        std::mem::swap(data_a, data_b);
 
         Ok(())
-    }
-
-    /// Write data to `target` buffer.
-    /// In case of error, this function will panic.
-    #[inline]
-    pub fn write<T: NoUninit>(&mut self, target: &str, data: &T) {
-        self.try_write(target, data).unwrap()
-    }
-
-    /// Write data to `target` buffer.
-    #[inline]
-    pub fn try_write_slice<T: NoUninit>(&mut self, target: &str, data: &[T]) -> Result<()> {
-        let Some(buffer) = &self.buffers.get(target) else {
-            return Err(Error::BufferNotFound(target.to_owned()));
-        };
-
-        let bytes = cast_slice(data);
-
-        self.render_queue.write_buffer(buffer, 0, bytes);
-
-        Ok(())
-    }
-
-    /// Write data to `target` buffer.
-    /// In case of error, this function will panic.
-    #[inline]
-    pub fn write_slice<T: NoUninit>(&mut self, target: &str, data: &[T]) {
-        self.try_write_slice(target, data).unwrap()
     }
 
     fn submit(&mut self) -> &mut Self {
@@ -415,16 +313,16 @@ impl<W: ComputeWorker> AppComputeWorker<W> {
                 }
             }
 
-            worker.read_staging_buffers().unwrap();
+            // worker.read_staging_buffers().unwrap();
             worker.submit();
-            worker.map_staging_buffers();
+            // worker.map_staging_buffers();
         }
 
         if worker.run_mode != RunMode::OneShot(false) && worker.poll() {
-            for (_, staging_buffer) in worker.staging_buffers.iter_mut() {
-                // By this the staging buffers would've been mapped.
-                staging_buffer.mapped = true;
-            }
+            // for (_, staging_buffer) in worker.staging_buffers.iter_mut() {
+            //     // By this the staging buffers would've been mapped.
+            //     staging_buffer.mapped = true;
+            // }
 
             worker.state = WorkerState::FinishedWorking;
             worker.command_encoder = Some(
@@ -437,15 +335,6 @@ impl<W: ComputeWorker> AppComputeWorker<W> {
                 RunMode::Continuous => {}
                 RunMode::OneShot(_) => worker.run_mode = RunMode::OneShot(false),
             };
-        }
-    }
-
-    pub(crate) fn unmap_all(mut worker: ResMut<Self>) {
-        for (_, staging_buffer) in &mut worker.staging_buffers {
-            if staging_buffer.mapped {
-                staging_buffer.buffer.unmap();
-                staging_buffer.mapped = false;
-            }
         }
     }
 

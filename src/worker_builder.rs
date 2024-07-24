@@ -1,17 +1,18 @@
-use std::{borrow::Cow, marker::PhantomData, time::Duration};
+use std::{borrow::Cow, marker::PhantomData, sync::Arc, time::Duration};
 
 use bevy::{
     prelude::{AssetServer, World},
     render::{
         render_resource::{
-            encase::{private::WriteInto, StorageBuffer, UniformBuffer},
-            Buffer, ComputePipelineDescriptor, ShaderRef, ShaderType,
+            encase::{internal::WriteInto, StorageBuffer, UniformBuffer},
+            Buffer, ComputePipelineDescriptor, Sampler, ShaderRef, ShaderType, Texture,
+            TextureView,
         },
         renderer::RenderDevice,
     },
     utils::HashMap,
 };
-use wgpu::{util::BufferInitDescriptor, BufferDescriptor, BufferUsages};
+use wgpu::{util::BufferInitDescriptor, BufferUsages, TextureViewDescriptor};
 
 use crate::{
     pipeline_cache::{AppPipelineCache, CachedAppComputePipelineId},
@@ -19,13 +20,19 @@ use crate::{
     worker::{AppComputeWorker, ComputePass, RunMode, StagingBuffer, Step},
 };
 
+#[derive(Clone)]
+pub enum BindingData {
+    Buffer(Arc<Buffer>),
+    Sampler(Arc<Sampler>),
+    TextureView(TextureView),
+}
+
 /// A builder struct to build [`AppComputeWorker<W>`]
 /// from your structs implementing [`ComputeWorker`]
 pub struct AppComputeWorkerBuilder<'a, W: ComputeWorker> {
     pub(crate) world: &'a mut World,
     pub(crate) cached_pipeline_ids: HashMap<String, CachedAppComputePipelineId>,
-    pub(crate) buffers: HashMap<String, Buffer>,
-    pub(crate) staging_buffers: HashMap<String, StagingBuffer>,
+    pub(crate) binding_data: HashMap<String, BindingData>,
     pub(crate) steps: Vec<Step>,
     pub(crate) run_mode: RunMode,
     /// Maximum duration the compute shader will run asyncronously before being set to synchronous.
@@ -45,13 +52,18 @@ impl<'a, W: ComputeWorker> AppComputeWorkerBuilder<'a, W> {
         Self {
             world,
             cached_pipeline_ids: HashMap::default(),
-            buffers: HashMap::default(),
-            staging_buffers: HashMap::default(),
+            binding_data: HashMap::default(),
             steps: vec![],
             run_mode: RunMode::Continuous,
             maximum_async_time: Some(Duration::from_secs(0)),
             _phantom: PhantomData,
         }
+    }
+
+    pub fn add_buffer(&mut self, name: &str, buffer: Arc<Buffer>) -> &mut Self {
+        self.binding_data
+            .insert(name.to_owned(), BindingData::Buffer(buffer));
+        self
     }
 
     /// Add a new uniform buffer to the worker, and fill it with `uniform`.
@@ -62,15 +74,15 @@ impl<'a, W: ComputeWorker> AppComputeWorkerBuilder<'a, W> {
 
         let render_device = self.world.resource::<RenderDevice>();
 
-        self.buffers.insert(
-            name.to_owned(),
-            render_device.create_buffer_with_data(&BufferInitDescriptor {
+        let uniform_buffer = Arc::new(render_device.create_buffer_with_data(
+            &BufferInitDescriptor {
                 label: Some(name),
                 contents: buffer.as_ref(),
                 usage: BufferUsages::COPY_DST | BufferUsages::UNIFORM,
-            }),
-        );
-        self
+            },
+        ));
+
+        self.add_buffer(name, uniform_buffer)
     }
 
     /// Add a new storage buffer to the worker, and fill it with `storage`. It will be read only.
@@ -80,15 +92,15 @@ impl<'a, W: ComputeWorker> AppComputeWorkerBuilder<'a, W> {
 
         let render_device = self.world.resource::<RenderDevice>();
 
-        self.buffers.insert(
-            name.to_owned(),
-            render_device.create_buffer_with_data(&BufferInitDescriptor {
+        let storage_buffer = Arc::new(render_device.create_buffer_with_data(
+            &BufferInitDescriptor {
                 label: Some(name),
                 contents: buffer.as_ref(),
                 usage: BufferUsages::COPY_DST | BufferUsages::STORAGE,
-            }),
-        );
-        self
+            },
+        ));
+
+        self.add_buffer(name, storage_buffer)
     }
 
     /// Add a new read/write storage buffer to the worker, and fill it with `storage`.
@@ -102,114 +114,24 @@ impl<'a, W: ComputeWorker> AppComputeWorkerBuilder<'a, W> {
 
         let render_device = self.world.resource::<RenderDevice>();
 
-        self.buffers.insert(
-            name.to_owned(),
-            render_device.create_buffer_with_data(&BufferInitDescriptor {
+        let rw_storage_buffer = Arc::new(render_device.create_buffer_with_data(
+            &BufferInitDescriptor {
                 label: Some(name),
                 contents: buffer.as_ref(),
                 usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
-            }),
-        );
-        self
+            },
+        ));
+
+        self.add_buffer(name, rw_storage_buffer)
     }
 
-    /// Create two staging buffers, one to read from and one to write to.
-    /// Additionally, it will create a read/write storage buffer to access from
-    /// your shaders.
-    /// The buffer will be filled with `data`
-    pub fn add_staging<T: ShaderType + WriteInto>(&mut self, name: &str, data: &T) -> &mut Self {
-        self.add_rw_storage(name, data);
-        let buffer = self.buffers.get(name).unwrap();
-
-        let render_device = self.world.resource::<RenderDevice>();
-
-        let staging = StagingBuffer {
-            mapped: true,
-            buffer: render_device.create_buffer(&BufferDescriptor {
-                label: Some(name),
-                size: buffer.size(),
-                usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
-                mapped_at_creation: true,
-            }),
-        };
-
-        self.staging_buffers.insert(name.to_owned(), staging);
-
-        self
+    pub fn add_texture(&mut self, name: &str, texture: &Texture) -> &mut Self {
+        self.add_texture_view(name, texture.create_view(&TextureViewDescriptor::default()))
     }
 
-    /// Add a new empty uniform buffer to the worker.
-    pub fn add_empty_uniform(&mut self, name: &str, size: u64) -> &mut Self {
-        let render_device = self.world.resource::<RenderDevice>();
-
-        self.buffers.insert(
-            name.to_owned(),
-            render_device.create_buffer(&BufferDescriptor {
-                label: Some(name),
-                size,
-                usage: BufferUsages::COPY_DST | BufferUsages::UNIFORM,
-                mapped_at_creation: false,
-            }),
-        );
-
-        self
-    }
-
-    /// Add a new empty storage buffer to the worker. It will be read only.
-    pub fn add_empty_storage(&mut self, name: &str, size: u64) -> &mut Self {
-        let render_device = self.world.resource::<RenderDevice>();
-
-        self.buffers.insert(
-            name.to_owned(),
-            render_device.create_buffer(&BufferDescriptor {
-                label: Some(name),
-                size,
-                usage: BufferUsages::COPY_DST | BufferUsages::STORAGE,
-                mapped_at_creation: false,
-            }),
-        );
-        self
-    }
-
-    /// Add a new empty read/write storage buffer to the worker.
-    pub fn add_empty_rw_storage(&mut self, name: &str, size: u64) -> &mut Self {
-        let render_device = self.world.resource::<RenderDevice>();
-
-        self.buffers.insert(
-            name.to_owned(),
-            render_device.create_buffer(&BufferDescriptor {
-                label: Some(name),
-                size,
-                usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
-                mapped_at_creation: false,
-            }),
-        );
-        self
-    }
-
-    /// Create two staging buffers, one to read from and one to write to.
-    /// Additionally, it will create a read/write storage buffer to access from
-    /// your shaders.
-    /// The buffer will empty.
-    pub fn add_empty_staging(&mut self, name: &str, size: u64) -> &mut Self {
-        self.add_empty_rw_storage(name, size);
-
-        let buffer = self.buffers.get(name).unwrap();
-
-        let render_device = self.world.resource::<RenderDevice>();
-
-        let staging = StagingBuffer {
-            mapped: true,
-            buffer: render_device.create_buffer(&BufferDescriptor {
-                label: Some(name),
-                size: buffer.size(),
-                usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
-                mapped_at_creation: true,
-            }),
-        };
-
-        self.staging_buffers.insert(name.to_owned(), staging);
-
+    pub fn add_texture_view(&mut self, name: &str, view: TextureView) -> &mut Self {
+        self.binding_data
+            .insert(name.to_owned(), BindingData::TextureView(view));
         self
     }
 

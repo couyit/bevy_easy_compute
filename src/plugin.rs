@@ -43,9 +43,6 @@ impl<W: ComputeWorker> Plugin for AppComputeWorkerPlugin<W> {
 
         app.insert_resource(worker)
             .add_systems(Update, AppComputeWorker::<W>::extract_pipelines)
-            .add_systems(
-                PostUpdate,
-                (AppComputeWorker::<W>::unmap_all, AppComputeWorker::<W>::run).chain(),
-            );
+            .add_systems(PostUpdate, AppComputeWorker::<W>::run);
     }
 }
