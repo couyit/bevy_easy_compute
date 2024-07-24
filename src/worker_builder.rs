@@ -17,7 +17,7 @@ use wgpu::{util::BufferInitDescriptor, BufferUsages, TextureViewDescriptor};
 use crate::{
     pipeline_cache::{AppPipelineCache, CachedAppComputePipelineId},
     traits::{ComputeShader, ComputeWorker},
-    worker::{AppComputeWorker, ComputePass, RunMode, StagingBuffer, Step},
+    worker::{AppComputeWorker, ComputePass, RunMode, Step},
 };
 
 #[derive(Clone)]

@@ -1,7 +1,6 @@
 use core::panic;
 use std::{
     marker::PhantomData,
-    ops::Deref,
     time::{Duration, SystemTime},
 };
 
@@ -11,12 +10,11 @@ use bevy::{
         render_resource::{Buffer, ComputePipeline},
         renderer::{RenderDevice, RenderQueue},
     },
-    utils::{hashbrown::hash_map::Entry, HashMap},
+    utils::HashMap,
 };
-use bytemuck::{bytes_of, cast_slice, from_bytes, AnyBitPattern, NoUninit};
 use wgpu::{
     BindGroupEntry, BindingResource, CommandEncoder, CommandEncoderDescriptor,
-    ComputePassDescriptor, TextureViewDescriptor,
+    ComputePassDescriptor,
 };
 
 use crate::{
@@ -137,11 +135,11 @@ impl<W: ComputeWorker> AppComputeWorker<W> {
                 },
                 BindingData::Sampler(sampler) => BindGroupEntry {
                     binding: index as u32,
-                    resource: BindingResource::Sampler(&sampler),
+                    resource: BindingResource::Sampler(sampler),
                 },
                 BindingData::TextureView(view) => BindGroupEntry {
                     binding: index as u32,
-                    resource: BindingResource::TextureView(&view),
+                    resource: BindingResource::TextureView(view),
                 },
                 _ => unreachable!(),
             };
