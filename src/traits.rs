@@ -9,7 +9,7 @@ use crate::worker::AppComputeWorker;
 
 /// Trait to declare [`AppComputeWorker<W>`] structs.
 pub trait ComputeWorker: Sized + Send + Sync + 'static {
-    fn build(app: &App) -> AppComputeWorker<Self>;
+    fn build(app: &mut App) -> AppComputeWorker<Self>;
 }
 
 /// Trait to declare your shaders.
