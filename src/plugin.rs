@@ -39,7 +39,7 @@ impl<W: ComputeWorker> Plugin for AppComputeWorkerPlugin<W> {
     fn build(&self, _app: &mut App) {}
 
     fn finish(&self, app: &mut App) {
-        let worker = W::build(app.world_mut());
+        let worker = W::build(app);
 
         app.insert_resource(worker)
             .add_systems(Update, AppComputeWorker::<W>::extract_pipelines)

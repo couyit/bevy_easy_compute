@@ -1,5 +1,5 @@
 use bevy::{
-    prelude::World,
+    app::App,
     reflect::TypePath,
     render::render_resource::{BindGroupLayout, ShaderDefVal, ShaderRef},
 };
@@ -9,7 +9,7 @@ use crate::worker::AppComputeWorker;
 
 /// Trait to declare [`AppComputeWorker<W>`] structs.
 pub trait ComputeWorker: Sized + Send + Sync + 'static {
-    fn build(world: &mut World) -> AppComputeWorker<Self>;
+    fn build(app: &App) -> AppComputeWorker<Self>;
 }
 
 /// Trait to declare your shaders.
